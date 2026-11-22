@@ -5,8 +5,10 @@ import type { EscrowContract } from '@/lib/api';
 import {
   appendNotification,
   clearNotifications,
+  dismiss,
   loadNotifications,
   markAllRead,
+  markRead,
   NotificationsStore,
   saveNotifications,
   unreadCount,
@@ -26,6 +28,8 @@ import {
   fetchContractById,
   POLL_INTERVAL_MS,
   PollerOptions,
+  PollErrorInfo,
+  STALE_AFTER_FAILURES,
   startPoller,
 } from '@/lib/poller';
 import { NOTIFICATIONS_KEY } from '@/lib/notifications';
@@ -48,12 +52,17 @@ interface NotificationsContextValue {
   isWatched: (id: number) => boolean;
   toggleWatch: (contract: EscrowContract) => void;
   markAllRead: () => void;
+  markRead: (id: string) => void;
+  dismiss: (id: string) => void;
   clear: () => void;
   announcement: string;
   desktopSettings: DesktopNotifySettings;
   desktopPermission: DesktopNotificationPermission;
   setDesktopEnabled: (enabled: boolean) => Promise<void>;
   toggleDesktopType: (type: WatchEventType) => void;
+  /** True after repeated failed polls, until the user dismisses it or polling recovers. */
+  updatesPaused: boolean;
+  dismissUpdatesPaused: () => void;
 }
 
 const NotificationsContext = createContext<NotificationsContextValue | null>(null);
@@ -69,6 +78,9 @@ export function NotificationsProvider({ children, poller }: NotificationsProvide
   const [announcement, setAnnouncement] = useState('');
   const [desktopSettings, setDesktopSettings] = useState<DesktopNotifySettings>(defaultDesktopSettings);
   const [desktopPermission, setDesktopPermission] = useState<DesktopNotificationPermission>('default');
+  const [stale, setStale] = useState(false);
+  const [staleDismissed, setStaleDismissed] = useState(false);
+  const staleRef = useRef(false);
   const notificationsRef = useRef(notifications);
   notificationsRef.current = notifications;
   const desktopSettingsRef = useRef(desktopSettings);
@@ -135,6 +147,23 @@ export function NotificationsProvider({ children, poller }: NotificationsProvide
         const last = events[events.length - 1];
         if (last) setAnnouncement(`${last.title}. ${unreadCount(next)} unread.`);
       },
+      onError: (info: PollErrorInfo) => {
+        poller?.onError?.(info);
+        if (info.consecutiveFailures >= STALE_AFTER_FAILURES) {
+          if (!staleRef.current) {
+            staleRef.current = true;
+            setStale(true);
+            setAnnouncement('Updates paused, retrying.');
+          }
+        }
+      },
+      onRecover: () => {
+        poller?.onRecover?.();
+        // Recovery re-arms the notice for the next outage.
+        staleRef.current = false;
+        setStale(false);
+        setStaleDismissed(false);
+      },
       onRemoved: (id: number) => {
         const next = unwatch(id);
         setWatchStore(next);
@@ -197,6 +226,24 @@ export function NotificationsProvider({ children, poller }: NotificationsProvide
     setAnnouncement('All notifications marked as read.');
   }, []);
 
+  const doMarkRead = useCallback((id: string) => {
+    const next = markRead(notificationsRef.current, id);
+    if (next === notificationsRef.current) return;
+    saveNotifications(next);
+    notificationsRef.current = next;
+    setNotifications(next);
+    setAnnouncement(`Notification marked as read. ${unreadCount(next)} unread.`);
+  }, []);
+
+  const doDismiss = useCallback((id: string) => {
+    const next = dismiss(notificationsRef.current, id);
+    if (next === notificationsRef.current) return;
+    saveNotifications(next);
+    notificationsRef.current = next;
+    setNotifications(next);
+    setAnnouncement(`Notification dismissed. ${unreadCount(next)} unread.`);
+  }, []);
+
   const doClear = useCallback(() => {
     const next = clearNotifications();
     notificationsRef.current = next;
@@ -249,6 +296,8 @@ export function NotificationsProvider({ children, poller }: NotificationsProvide
     setDesktopSettings(next);
   }, []);
 
+  const dismissUpdatesPaused = useCallback(() => setStaleDismissed(true), []);
+
   const value = useMemo<NotificationsContextValue>(
     () => ({
       items: notifications.items,
@@ -257,25 +306,18 @@ export function NotificationsProvider({ children, poller }: NotificationsProvide
       isWatched: (id: number) => watchStore.items.some((i) => i.id === id),
       toggleWatch,
       markAllRead: doMarkAllRead,
+      markRead: doMarkRead,
+      dismiss: doDismiss,
       clear: doClear,
       announcement,
       desktopSettings,
       desktopPermission,
       setDesktopEnabled,
       toggleDesktopType,
+      updatesPaused: stale && !staleDismissed,
+      dismissUpdatesPaused,
     }),
-    [
-      notifications,
-      watchStore,
-      toggleWatch,
-      doMarkAllRead,
-      doClear,
-      announcement,
-      desktopSettings,
-      desktopPermission,
-      setDesktopEnabled,
-      toggleDesktopType,
-    ],
+    [notifications, watchStore, toggleWatch, doMarkAllRead, doMarkRead, doDismiss, doClear, announcement],
   );
 
   return <NotificationsContext.Provider value={value}>{children}</NotificationsContext.Provider>;
